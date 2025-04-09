@@ -17,7 +17,7 @@ from torch.autograd import Variable
 from wideresnet import WideResNet
 
 # used for logging to TensorBoard
-from tensorboard_logger import configure, log_value
+from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch WideResNet Training')
 parser.add_argument('--dataset', default='cifar10', type=str,
@@ -53,11 +53,13 @@ parser.add_argument('--tensorboard',
 parser.set_defaults(augment=True)
 
 best_prec1 = 0
+def pad_image(x):
+    return F.pad(x.unsqueeze(0), (4, 4, 4, 4), mode='reflect').squeeze()
 
 def main():
     global args, best_prec1
     args = parser.parse_args()
-    if args.tensorboard: configure("runs/%s"%(args.name))
+    writer = SummaryWriter("runs/%s"%(args.name))
 
     # Data loading code
     normalize = transforms.Normalize(mean=[x/255.0 for x in [125.3, 123.0, 113.9]],
@@ -66,9 +68,7 @@ def main():
     if args.augment:
         transform_train = transforms.Compose([
         	transforms.ToTensor(),
-        	transforms.Lambda(lambda x: F.pad(
-        						Variable(x.unsqueeze(0), requires_grad=False, volatile=True),
-        						(4,4,4,4),mode='reflect').data.squeeze()),
+        	transforms.Lambda(pad_image),
             transforms.ToPILImage(),
             transforms.RandomCrop(32),
             transforms.RandomHorizontalFlip(),
@@ -106,7 +106,8 @@ def main():
     # for training on multiple GPUs.
     # Use CUDA_VISIBLE_DEVICES=0,1 to specify which GPUs to use
     # model = torch.nn.DataParallel(model).cuda()
-    model = model.cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     bin_op=binaryconnect.BC(model)
     # optionally resume from a checkpoint
     if args.resume:
@@ -124,19 +125,19 @@ def main():
     cudnn.benchmark = True
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum, nesterov = args.nesterov,
                                 weight_decay=args.weight_decay)
 
     for epoch in range(args.start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch+1)
+        adjust_learning_rate(optimizer, epoch+1, writer)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch,bin_op)
+        train(train_loader, model, criterion, optimizer, epoch, bin_op, writer, device)
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion, epoch,bin_op)
+        prec1 = validate(val_loader, model, criterion, epoch, bin_op, writer, device)
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
@@ -148,7 +149,7 @@ def main():
         }, is_best)
         print("Best accuracy: "+str(best_prec1))
 
-def train(train_loader, model, criterion, optimizer, epoch,bin_op):
+def train(train_loader, model, criterion, optimizer, epoch, bin_op, writer, device):
     """Train for one epoch on the training set"""
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -159,8 +160,8 @@ def train(train_loader, model, criterion, optimizer, epoch,bin_op):
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
-        target = target.cuda(async=True)
-        input = input.cuda()
+        target = target.to(device, non_blocking=True)
+        input = input.to(device)
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
         bin_op.binarization() # use bin_op.BWN() instead for Binary Weight Network 
@@ -170,8 +171,8 @@ def train(train_loader, model, criterion, optimizer, epoch,bin_op):
 
         # measure accuracy and record loss
         prec1 = accuracy(output.data, target, topk=(1,))[0]
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -192,10 +193,10 @@ def train(train_loader, model, criterion, optimizer, epoch,bin_op):
                       loss=losses, top1=top1))
     # log to TensorBoard
     if args.tensorboard:
-        log_value('train_loss', losses.avg, epoch)
-        log_value('train_acc', top1.avg, epoch)
+        writer.add_scalar('train_loss', losses.avg, epoch)
+        writer.add_scalar('train_acc', top1.avg, epoch)
 
-def validate(val_loader, model, criterion, epoch,bin_op):
+def validate(val_loader, model, criterion, epoch, bin_op, writer, device):
     """Perform validation on the validation set"""
     batch_time = AverageMeter()
     losses = AverageMeter()
@@ -207,8 +208,8 @@ def validate(val_loader, model, criterion, epoch,bin_op):
     end = time.time()
     bin_op.binarization() # use bin_op.BWN() instead for Binary Weight Network
     for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input = input.cuda()
+        target = target.to(device, non_blocking=True)
+        input = input.to(device)
         input_var = torch.autograd.Variable(input, volatile=True)
         target_var = torch.autograd.Variable(target, volatile=True)
 
@@ -218,8 +219,8 @@ def validate(val_loader, model, criterion, epoch,bin_op):
 
         # measure accuracy and record loss
         prec1 = accuracy(output.data, target, topk=(1,))[0]
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
+        losses.update(loss.item(), input.size(0))
+        top1.update(prec1.item(), input.size(0))
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -237,8 +238,8 @@ def validate(val_loader, model, criterion, epoch,bin_op):
     print(' * Prec@1 {top1.avg:.3f}'.format(top1=top1))
     # log to TensorBoard
     if args.tensorboard:
-        log_value('val_loss', losses.avg, epoch)
-        log_value('val_acc', top1.avg, epoch)
+        writer.add_scalar('val_loss', losses.avg, epoch)
+        writer.add_scalar('val_acc', top1.avg, epoch)
     return top1.avg
 
 
@@ -270,12 +271,12 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch):
+def adjust_learning_rate(optimizer, epoch, writer):
     """Sets the learning rate to the initial LR divided by 5 at 60th, 120th and 160th epochs"""
     lr = args.lr * ((0.2 ** int(epoch >= 60)) * (0.2 ** int(epoch >= 120))* (0.2 ** int(epoch >= 160)))
     # log to TensorBoard
     if args.tensorboard:
-        log_value('learning_rate', lr, epoch)
+        writer.add_scalar('learning_rate', lr, epoch)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
