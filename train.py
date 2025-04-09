@@ -108,7 +108,7 @@ def main():
     # model = torch.nn.DataParallel(model).cuda()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    bin_op=binaryconnect.BC(model)
+    bin_op = binaryconnect.BC(model)
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
